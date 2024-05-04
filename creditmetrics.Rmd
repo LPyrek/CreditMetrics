@@ -1,0 +1,299 @@
+---
+title: "CreditMetrics"
+author: "Łukasz Pyrek"
+date: "2024-03-23"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+**Credit Metrics**
+
+Model CreditMetrics pomaga ocenić ryzyko kredytowe dla portfeli. Można go stosować dla dowolnych instrumentów finansowych które da się wycenić. Jego główną metryką jest Value at Risk (VaR), która określa maksymalną możliwą stratę, jaką portfel może ponieść w określonym okresie czasu przy danym poziomie ufności.
+
+#### W celu obliczenia 99.9% VaR dla portfela 3 obligacji korzystam z napisanej przez siebie funkcji CreditMetrics.
+
+**Argumenty**:
+
+*varLevel* - poziom ufności VaR'u
+
+*trans_prob* - macierz przejścia ratingów
+
+*return_rates* - tabela stóp zwrotu
+
+*recovery_rates* - tabela stóp odzysku (średnia i odchylenie standardowe)
+
+*n_scenario* - liczba generowanych scenariuszy
+
+**Argumenty dotyczące portfela obligacji:**
+
+*corr_matrix* - macierz korelacji obligacji
+
+*bond_rating* - wektor ratingów obligacji
+
+*bond_security* - wektor klas stopy odzysku obligacji
+
+*bond_coupon* - wektor wartości rocznych kuponów obligacji (NA = brak kuponu)
+
+*bond_nominal* - wektor wartości nominalnych obligacji
+
+*bond_maturity* - wektor zapadalności obligacji (w latach)
+
+**Output:**
+
+\$varValue - VaR wartości portfela dla podanego kwantyla
+
+\$esValue - Expected Shortfall wartości portfela dla podanego kwantyla
+
+\$varLoss - VaR straty (basePortfolioValue - varValue)
+
+\$esLoss - ES straty (basePortfolioValue - esLoss)
+
+\$basePortfolioValue - wartość portfela gdy ratingi się nie zmieniły
+
+\$scenarios_value - tabela wycenionych obligacji wygenerowanych scenariuszy
+
+\$scenarios_rating - tabela ratingów obligacji wygenerowanych scenariuszy
+<br /> 
+<br />
+<br />
+Funkcja dla podanego kwantyla zwraca dwie wartości dla VaR i ES. varValue dotyczy wartości portfela, natomiast varLoss odnosi się do straty. Analogicznie esValue i esLoss.
+
+W celu obliczenia wartości stopy odzysku obligacji (wycena w przypadku ratingu 'Def') nominalna wartość jest przemnażana przez losową wartość z rozkładu beta o parametrach równych średniej i odchyleniu standardowym dla danej klasy stopy odzysku. (Dokumentacja Credit Metrics 116s.)
+
+```{r}
+creditmetrics <- function(varLevel, trans_prob, return_rates, recovery_rates,
+                          n_scenario, corr_matrix, bond_rating, bond_seniority,
+                          bond_coupon, bond_nominal, bond_maturity){
+  
+  labels <- c('AAA','AA','A','BBB','BB','B','CCC','Def')
+  # Generate scenarios
+  scenarios <- rmvnorm(n_scenario, sigma = corr_matrix)
+  scenarios <- as.data.frame(scenarios)
+  
+  # Initialize intervals
+  intervals <- list()
+  for(i in 1:nrow(trans_prob)){
+    intervals[[labels[i]]] <- trans_prob[i,]
+    intervals[[i]]['upper',] <- rep(0,length(trans_prob))
+    intervals[[i]]['lower',] <- rep(0,length(trans_prob))
+  }
+  
+  # Calculate intervals
+  for(j in 1:length(intervals)){
+    curr <- 1
+    for(i in 1:length(intervals[[1]])){
+      intervals[[j]]['upper',i] <- qnorm(curr)
+      curr <- curr - intervals[[j]][1,i]
+      if(curr <= 0) curr <- 0
+      intervals[[j]]['lower',i] <- qnorm(curr)
+    }
+  }
+  
+  # Rating scenarios
+  scenarios_rating <- data.frame(matrix(ncol = length(bond_rating), nrow = nrow(scenarios)))
+  for(i in 1:length(bond_rating)){
+    interval <- intervals[[bond_rating[i]]]['upper',]
+    interval <- rev(interval)
+    interval <- append(-Inf,as.numeric(interval))
+    ratings <- findInterval(scenarios[,i],interval)
+    scenarios_rating[i] <- rev(labels)[ratings]
+  }
+  
+  # Function to calculate bond value
+  bond_value <- function(nominal_value, rate, coupon, maturity) {
+    # Check for zero-coupon case
+    if (is.na(coupon)) {
+      return(nominal_value / (1 + rate[maturity-1])^(maturity-1))
+    }
+    
+    coupon_val <- coupon*nominal_value
+    coupon_pv <- coupon_val
+    for(i in 1:(maturity-1)){
+      coupon_pv <- coupon_pv + coupon_val/(1+rate[i])^i
+    }
+    face_pv <- nominal_value/(1+rate[(maturity-1)])^(maturity-1)
+    return(coupon_pv + face_pv)
+  }
+  
+  # Calculations for bond values
+  base_val <- c()
+  scenarios_value <- scenarios_rating
+  for(i in 1:length(bond_rating)){ 
+    bonds_valTable <- c() # Calculate possible bond values for each rating
+    
+    for(j in 1:nrow(return_rates)){
+      bonds_valTable<-
+        append(bonds_valTable,
+               bond_value(bond_nominal[i],as.numeric(return_rates[j,1:(bond_maturity[i]-1)]),bond_coupon[i],bond_maturity[i]))
+    }
+    
+    # Base value when ratings don't change
+    base_val <- append(base_val, bonds_valTable[which(labels == bond_rating[i])])
+    scenarios_value[i] <-
+      apply(scenarios_rating[i], 1 , FUN = function(x){ 
+        if(x == "Def"){ # Default scenario
+          m <- switch(bond_seniority[i],
+                      'seniorSecured' = 1,
+                      'seniorUnsecured' = 2,
+                      'seniorSubordinated' = 3,
+                      'subordinated' = 4,
+                      'juniorSubordinated' = 5
+          )
+          rbeta(1,recovery_rates[m,1],recovery_rates[m,2])*bond_nominal[i] # Calculate recovery value
+        }else{ # Non-default scenario
+          bonds_valTable[which(labels == x)] # Lookup bond value for given rating
+        }
+      })
+  }
+  
+  # Calculate total scenario values and risk measures
+  scenarios_value <- transform(scenarios_value, sumVal = rowSums(scenarios_value))
+  varValue <- quantile(scenarios_value$sumVal, probs = 1 - varLevel)
+  esValue <- mean(scenarios_value$sumVal[scenarios_value$sumVal < varValue])
+  varLoss <- sum(base_val) - varValue
+  esLoss <- sum(base_val) - esValue
+  return(list(varValue = varValue,
+              esValue = esValue,
+              varLoss = varLoss,
+              esLoss = esLoss,
+              basePortfolioValue = sum(base_val),
+              scenarios_value = scenarios_value,
+              scenarios_rating = scenarios_rating,intervals = intervals))
+}
+```
+
+### Implementacja:
+
+Dla lepszej dokładności wyników obliczymy VaR i ES 50 razy dla 20000 scenariuszy, a następnie uśrednimy wynik.
+
+**Wczytanie danych:** 
+
+3-letnia obligacja o ratingu A (cena wykupu 100 000 zł, subordinated)
+
+5-letnia obligacja o ratingu B (cena wykupu 50 000 zł, roczne kupony 5000 zł, senior secured)
+
+2-letnia obligacja o ratingu CCC (cena wykupu 50 000 zł, roczne kupony 10 000 zł, senior unsecured)
+
+```{r warning=FALSE}
+library(readxl)
+library(mvtnorm)
+library(rstudioapi)
+setwd(dirname(getActiveDocumentContext()$path))
+
+trans_prob <- data.frame(read_xlsx('projekt2_tabela.xlsx'))
+return_rates <- data.frame(read_xlsx('return_rates.xlsx'))
+
+return_rates <- lapply(return_rates, FUN = as.numeric)
+return_rates <- as.data.frame(return_rates)/100
+
+
+recovery_rates<- matrix(c(53.80, 51.13, 38.52, 32.74, 17.09,
+                          26.86, 25.45, 23.81, 20.18, 10.90), ncol=2, nrow=5)
+recovery_rates <- recovery_rates/100
+
+corr <- c(1, 0.2, 0.15, 0.2, 1, 0.4, 0.15, 0.4, 1)
+corr_matrix <- matrix(corr,3,3)
+
+bond_rating <- c('A','B','CCC')
+bond_seniority <- c('subordinated','seniorSecured','seniorUnsecured')
+bond_coupon <- c(NA, 0.1, 0.2)
+bond_nominal <- c(100000, 50000, 50000)
+bond_maturity <- c(3,5,2)
+```
+
+```{r, cache = TRUE}
+models <- matrix(rep(0,100),ncol=2,nrow=50)
+for(i in 0:50){
+  model <- creditmetrics(0.999,trans_prob,return_rates,recovery_rates,
+                         20000,corr_matrix,bond_rating,bond_seniority,
+                         bond_coupon,bond_nominal,bond_maturity)
+  models[i,1] <- model$varValue
+  models[i,2] <- model$esValue
+}
+```
+
+```{r}
+cat(paste0("99.9% VaR:\n",
+           " Wartość portfela: ", round(mean(models[,1]),2), "\n",
+           " Straty: ", round(model$basePortfolioValue - mean(models[,1]),2), "\n",
+           " SD: ", round(sd(models[,1]),2), "\n",
+           "ES:\n",
+           " Wartość portfela: ", round(mean(models[,2]),2), "\n",
+           " Straty: ", round(model$basePortfolioValue - mean(models[,2]),2), "\n",
+           " SD: ", round(sd(models[,2]),2)))
+```
+
+Interpretacja wyników:
+
+Na 99.9% wartość portfela nie będzie mniejsza niż 103442.58zł, a straty nie większe niż 108301.45zł.
+
+W przypadku 0.01% najgorszych przypadków średnia wartość portfela wyniesie 97859.10zł, a straty 113884,93zł.
+
+### Przypadek zerowej korelacji:
+
+```{r, cache = TRUE}
+models2 <- matrix(rep(0,100),ncol=2,nrow=50)
+corr0 <- c(1, 0, 0, 0, 1, 0, 0, 0, 1)
+corr_matrix0 <- matrix(corr,3,3)
+for(i in 0:50){
+  model2 <- creditmetrics(0.999,trans_prob,return_rates,recovery_rates,
+                         20000,corr_matrix0,bond_rating,bond_seniority,
+                         bond_coupon,bond_nominal,bond_maturity)
+  models2[i,1] <- model2$varValue
+  models2[i,2] <- model2$esValue
+}
+```
+
+```{r}
+cat(paste0("99.9% VaR:\n",
+           " Wartość portfela: ", round(mean(models2[,1]),2), "\n",
+           " Straty: ", round(model2$basePortfolioValue - mean(models2[,1]),2), "\n",
+           " SD: ", round(sd(models2[,1]),2), "\n",
+           "ES:\n",
+           " Wartość portfela: ", round(mean(models2[,2]),2), "\n",
+           " Straty: ", round(model$basePortfolioValue - mean(models2[,2]),2), "\n",
+           " SD: ", round(sd(models2[,2]),2)))
+```
+
+W przypadku zerowej korelacji VaR i ES strat jest mniejsze, występuje mniejsze ryzyko.
+
+Dywersyfikacja ryzyka to strategia inwestycyjna polegająca na rozłożeniu kapitału na różne aktywa, sektory lub klasy instrumentów finansowych. Celem dywersyfikacji jest zmniejszenie ogólnego ryzyka portfela poprzez zminimalizowanie wpływu strat w jednym obszarze na pozostałe.
+
+### Symulacje dla różnej ilości scenariuszy
+Dla poszczególnych ilości scenariuszy obliczymy VaR i ES 50 razy, a następnie obliczymy odchylenie standardowe. Pozwoli nam to zbadać jak liczba scenariuszy wpływa na dokładność wyników.
+
+```{r, cache = TRUE}
+dfSD <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(dfSD) <- c('n',"sdVAR","sdES")
+n_scenario <- c(seq(100,1000,100),seq(1000,20000,500))
+for(n in n_scenario){
+  models3 <- matrix(rep(0,100),ncol=2,nrow=50)
+  for(i in 0:50){
+    model3 <- creditmetrics(0.999,trans_prob,return_rates,recovery_rates,
+                           n,corr_matrix,bond_rating,bond_seniority,
+                           bond_coupon,bond_nominal,bond_maturity)
+    models3[i,1] <- model3$varValue
+    models3[i,2] <- model3$esValue
+  }
+  sdVAR <- sd(models3[,1])
+  sdES <- sd(models3[,2])
+  dfSD <- rbind(dfSD,c(n,sdVAR,sdES))
+}
+```
+```{r}
+library(ggplot2)
+colnames(dfSD) <- c('n',"sdVAR","sdES")
+ggplot(data = dfSD) +
+  geom_line(aes(n, sdVAR, color = "sdVAR")) +
+  geom_line(aes(n, sdES, color = "sdES")) +
+  scale_color_manual(values = c("sdVAR" = "blue", "sdES" = "red"),
+                     labels = c("sdVAR", "sdES")) +
+  labs(color = "Variable", y = "Value")
+```
+
+Wraz z większą ilością symulacji odchylenie standardowe maleje. Już w przypadku 5000 dostajemy stosunkowo małe odchylenie standardowe i wprowadzenie większej liczby scenariuszy nie daję znaczącej poprawy. Jednakże, należy pamiętać że ten wykres odpowiada VaRowi 99.9%. Wykres może się znacząco róznić dla innego kwantyla oraz danych.
